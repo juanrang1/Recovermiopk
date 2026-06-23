@@ -205,11 +205,13 @@ static bool suffix_to_scalar(const char* suf,int prefixlen,u64 r[4]){
 int main(int argc,char**argv){
   const char* suffix=0; const char* addrhex=0; u64 start=0; bool st_only=false;
   int blocks=8192,threads=256; unsigned run=8192; int prefixlen=12;
+  u64 endarg=0; bool has_end=false;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--suffix")&&i+1<argc) suffix=argv[++i];
     else if(!strcmp(argv[i],"--addr")&&i+1<argc) addrhex=argv[++i];
     else if(!strcmp(argv[i],"--prefixlen")&&i+1<argc) prefixlen=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--start")&&i+1<argc) start=strtoull(argv[++i],0,16);
+    else if(!strcmp(argv[i],"--end")&&i+1<argc){ endarg=strtoull(argv[++i],0,16); has_end=true; }
     else if(!strcmp(argv[i],"--blocks")&&i+1<argc) blocks=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) threads=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--run")&&i+1<argc) run=(unsigned)strtoul(argv[++i],0,10);
@@ -267,15 +269,16 @@ int main(int argc,char**argv){
   CUDA_CHECK(cudaMemcpyToSymbol(c_target,target,20));
 
   const u64 TOTAL = 1ull << (4*prefixlen);   // 16^N
-  u64 base=start; u64 per=(u64)blocks*threads*run;
+  u64 endp = (has_end && endarg<=TOTAL) ? endarg : TOTAL;
+  u64 base=start; u64 range = (endp>start)?(endp-start):0; u64 per=(u64)blocks*threads*run;
   printf("\n== BUSQUEDA (prefixlen=%d, 16^%d=%llu, BATCH=%d, %dx%d, run=%u) ==\n",
          prefixlen,prefixlen,TOTAL,BATCH,blocks,threads,run);
-  printf("inicio 0x%0*llx\n", prefixlen, base);
+  printf("rango [0x%0*llx , 0x%0*llx)  (%llu prefijos)\n", prefixlen, start, prefixlen, endp, range);
   int zero=0; CUDA_CHECK(cudaMemcpyToSymbol(g_found,&zero,sizeof(int)));
   cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-  while(base<TOTAL){
+  while(base<endp){
     cudaEventRecord(e0);
-    search_kernel<<<blocks,threads>>>(base,run,TOTAL); CUDA_CHECK(cudaGetLastError());
+    search_kernel<<<blocks,threads>>>(base,run,endp); CUDA_CHECK(cudaGetLastError());
     cudaEventRecord(e1); CUDA_CHECK(cudaEventSynchronize(e1));
     float ms=0; cudaEventElapsedTime(&ms,e0,e1);
     int found=0; CUDA_CHECK(cudaMemcpyFromSymbol(&found,g_found,sizeof(int)));
@@ -283,9 +286,11 @@ int main(int argc,char**argv){
       printf("\n*** ENCONTRADA ***\nprefijo (%d hex): %0*llx\nclave privada  : %0*llx%s\n",
              prefixlen, prefixlen, pref, prefixlen, pref, suffix);
       return 0; }
-    u64 cov=(base+per<=TOTAL)?per:(TOTAL-base); base+=cov;
-    double rate=(ms>0)?(cov/(ms/1000.0)):0, eta=(rate>0)?((double)(TOTAL-base)/rate):0;
-    printf("0x%0*llx  %.4f%%  %.1f Mkeys/s  ETA %.2f h\r",prefixlen,base,(double)base/TOTAL*100.0,rate/1e6,eta/3600.0);
+    u64 cov=(base+per<=endp)?per:(endp-base); base+=cov;
+    double done=(double)(base-start), rate=(ms>0)?(cov/(ms/1000.0)):0;
+    double eta=(rate>0)?((double)(endp-base)/rate):0;
+    printf("0x%0*llx  %.4f%%  %.1f Mkeys/s  ETA %.2f h\r",
+           prefixlen, base, range?done/(double)range*100.0:100.0, rate/1e6, eta/3600.0);
     fflush(stdout);
   }
   printf("\nEspacio agotado sin coincidencia. Revisa sufijo/direccion/prefixlen.\n");
