@@ -1,16 +1,18 @@
 // recover_fast.cu
 // -----------------------------------------------------------------------------
-// Version optimizada: aritmetica de campo en 64 bits (4 limbs) usando __int128,
-// inversion por lotes Montgomery con tamano configurable, y perillas de tuning.
-// Misma matematica y mismo self-test que recover.cu, pero ~varias veces mas rapida.
+// Recuperacion de los N primeros hex de una clave privada ETH (N configurable).
+//   priv = (prefijo << shift) | sufijo ,  shift = (64 - N) * 4 bits
+//   prefijo = N hex desconocidos (parte alta)   -> 16^N candidatos
+//   sufijo  = (64 - N) hex conocidos (parte baja)
 //
-// Recuperacion de los 12 primeros hex de una clave privada ETH:
-//   priv = (prefijo << 208) | sufijo
+// MISMA matematica, MISMA curva, MISMO self-test para cualquier N. Solo cambia
+// cuantos hex del inicio se barren (--prefixlen). Por eso una prueba con N=4
+// valida exactamente el mismo camino que usaras con N=12.
 //
-// Build (RTX 5090, CUDA >= 12.8):
-//   nvcc -O3 -arch=sm_120 recover_fast.cu -o recover_fast
+// Aritmetica de campo en 64 bits (__int128), inversion por lotes Montgomery.
 //
-// Si tu compilador se queja de __int128 en device, avisame y cambio a PTX inline.
+// Build (RTX 5090, CUDA >= 12.8):  nvcc -O3 -arch=sm_120 recover_fast.cu -o recover_fast
+//   (4090 -> sm_89, 3090 -> sm_86)
 // -----------------------------------------------------------------------------
 #include <cstdio>
 #include <cstdint>
@@ -24,93 +26,46 @@
 
 typedef unsigned long long u64;
 typedef unsigned __int128   u128;
-
 #define HD __host__ __device__ __forceinline__
 
-// ===== Tuning (ajusta y recompila; reporta Mkeys/s de cada combinacion) =====
 #ifndef BATCH
-#define BATCH 64          // tamano de lote de inversion Montgomery (prueba 32/64/128)
+#define BATCH 64
 #endif
 
 // ============================ CAMPO secp256k1 (4x u64, LE) ===================
-// p = 2^256 - 0x1000003D1.   2^256 ≡ C (mod p),  C = 0x1000003D1.
-#define SECP_C  0x1000003D1ull
+#define SECP_C  0x1000003D1ull   // 2^256 ≡ C (mod p)
 
 HD void f_copy(u64 r[4], const u64 a[4]){ r[0]=a[0]; r[1]=a[1]; r[2]=a[2]; r[3]=a[3]; }
 HD void f_zero(u64 r[4]){ r[0]=r[1]=r[2]=r[3]=0; }
 HD bool f_iszero(const u64 a[4]){ return (a[0]|a[1]|a[2]|a[3])==0; }
-HD bool f_eq(const u64 a[4], const u64 b[4]){ return a[0]==b[0]&&a[1]==b[1]&&a[2]==b[2]&&a[3]==b[3]; }
-
-HD void f_get_p(u64 p[4]){
-  p[0]=0xFFFFFFFEFFFFFC2Full; p[1]=0xFFFFFFFFFFFFFFFFull;
-  p[2]=0xFFFFFFFFFFFFFFFFull; p[3]=0xFFFFFFFFFFFFFFFFull;
-}
-HD bool f_geq(const u64 a[4], const u64 b[4]){
-  for(int i=3;i>=0;i--){ if(a[i]>b[i]) return true; if(a[i]<b[i]) return false; }
-  return true;
-}
-HD void f_sub_raw(u64 r[4], const u64 a[4], const u64 b[4]){ // r=a-b mod 2^256
-  u128 borrow=0;
-  for(int i=0;i<4;i++){ u128 d=(u128)a[i]-b[i]-borrow; r[i]=(u64)d; borrow=(d>>64)&1; }
-}
-HD void f_cond_sub_p(u64 r[4]){
-  u64 p[4]; f_get_p(p);
-  if(f_geq(r,p)) f_sub_raw(r,r,p);
-  if(f_geq(r,p)) f_sub_raw(r,r,p);
-}
+HD void f_get_p(u64 p[4]){ p[0]=0xFFFFFFFEFFFFFC2Full; p[1]=p[2]=p[3]=0xFFFFFFFFFFFFFFFFull; }
+HD bool f_geq(const u64 a[4], const u64 b[4]){ for(int i=3;i>=0;i--){ if(a[i]>b[i])return true; if(a[i]<b[i])return false; } return true; }
+HD void f_sub_raw(u64 r[4], const u64 a[4], const u64 b[4]){ u128 bo=0; for(int i=0;i<4;i++){ u128 d=(u128)a[i]-b[i]-bo; r[i]=(u64)d; bo=(d>>64)&1; } }
+HD void f_cond_sub_p(u64 r[4]){ u64 p[4]; f_get_p(p); if(f_geq(r,p)) f_sub_raw(r,r,p); if(f_geq(r,p)) f_sub_raw(r,r,p); }
 HD void f_add_small(u64 r[4], u64 k){ u128 c=k; for(int i=0;i<4&&c;i++){ u128 s=(u128)r[i]+c; r[i]=(u64)s; c=s>>64; } }
-
-HD void f_add(u64 r[4], const u64 a[4], const u64 b[4]){
-  u128 carry=0;
-  for(int i=0;i<4;i++){ u128 s=(u128)a[i]+b[i]+carry; r[i]=(u64)s; carry=s>>64; }
-  if(carry) f_add_small(r, SECP_C);   // 2^256 ≡ C
-  f_cond_sub_p(r);
-}
-HD void f_sub(u64 r[4], const u64 a[4], const u64 b[4]){
-  u128 borrow=0;
-  for(int i=0;i<4;i++){ u128 d=(u128)a[i]-b[i]-borrow; r[i]=(u64)d; borrow=(d>>64)&1; }
-  if(borrow){ u64 p[4]; f_get_p(p); u128 c=0;
-    for(int i=0;i<4;i++){ u128 s=(u128)r[i]+p[i]+c; r[i]=(u64)s; c=s>>64; } }
-}
-
-// Reduccion de 512 bits (8 limbs) -> 256 bits, plegando hi*C.
+HD void f_add(u64 r[4], const u64 a[4], const u64 b[4]){ u128 c=0; for(int i=0;i<4;i++){ u128 s=(u128)a[i]+b[i]+c; r[i]=(u64)s; c=s>>64; } if(c) f_add_small(r,SECP_C); f_cond_sub_p(r); }
+HD void f_sub(u64 r[4], const u64 a[4], const u64 b[4]){ u128 bo=0; for(int i=0;i<4;i++){ u128 d=(u128)a[i]-b[i]-bo; r[i]=(u64)d; bo=(d>>64)&1; } if(bo){ u64 p[4]; f_get_p(p); u128 c=0; for(int i=0;i<4;i++){ u128 s=(u128)r[i]+p[i]+c; r[i]=(u64)s; c=s>>64; } } }
 HD void f_reduce_wide(u64 prod[8], u64 r[4]){
   for(int it=0; it<4; it++){
     if((prod[4]|prod[5]|prod[6]|prod[7])==0) break;
-    u64 hi[4]={prod[4],prod[5],prod[6],prod[7]};
-    prod[4]=prod[5]=prod[6]=prod[7]=0;
+    u64 hi[4]={prod[4],prod[5],prod[6],prod[7]}; prod[4]=prod[5]=prod[6]=prod[7]=0;
     u128 carry=0;
-    for(int k=0;k<8;k++){
-      u128 cur=(u128)prod[k]+carry;
-      if(k<4) cur += (u128)SECP_C * hi[k];   // low64 aqui, high64 via carry -> limb k+1
-      prod[k]=(u64)cur; carry=cur>>64;
-    }
+    for(int k=0;k<8;k++){ u128 cur=(u128)prod[k]+carry; if(k<4) cur+=(u128)SECP_C*hi[k]; prod[k]=(u64)cur; carry=cur>>64; }
   }
-  r[0]=prod[0]; r[1]=prod[1]; r[2]=prod[2]; r[3]=prod[3];
-  f_cond_sub_p(r);
+  r[0]=prod[0]; r[1]=prod[1]; r[2]=prod[2]; r[3]=prod[3]; f_cond_sub_p(r);
 }
 HD void f_mul(u64 r[4], const u64 a[4], const u64 b[4]){
   u64 prod[8]={0,0,0,0,0,0,0,0};
-  for(int i=0;i<4;i++){
-    u128 carry=0;
-    for(int j=0;j<4;j++){
-      u128 t=(u128)a[i]*b[j] + prod[i+j] + carry;
-      prod[i+j]=(u64)t; carry=t>>64;
-    }
-    int k=i+4;
-    while(carry){ u128 t=(u128)prod[k]+carry; prod[k]=(u64)t; carry=t>>64; k++; }
-  }
+  for(int i=0;i<4;i++){ u128 carry=0;
+    for(int j=0;j<4;j++){ u128 t=(u128)a[i]*b[j]+prod[i+j]+carry; prod[i+j]=(u64)t; carry=t>>64; }
+    int k=i+4; while(carry){ u128 t=(u128)prod[k]+carry; prod[k]=(u64)t; carry=t>>64; k++; } }
   f_reduce_wide(prod,r);
 }
 HD void f_sqr(u64 r[4], const u64 a[4]){ f_mul(r,a,a); }
-
 HD void f_inv(u64 r[4], const u64 a[4]){
-  u64 e[4]={0xFFFFFFFEFFFFFC2Dull,0xFFFFFFFFFFFFFFFFull,0xFFFFFFFFFFFFFFFFull,0xFFFFFFFFFFFFFFFFull}; // p-2
+  u64 e[4]={0xFFFFFFFEFFFFFC2Dull,0xFFFFFFFFFFFFFFFFull,0xFFFFFFFFFFFFFFFFull,0xFFFFFFFFFFFFFFFFull};
   u64 res[4]={1,0,0,0}, base[4]; f_copy(base,a);
-  for(int bit=0; bit<256; bit++){
-    if((e[bit>>6]>>(bit&63))&1ull) f_mul(res,res,base);
-    f_sqr(base,base);
-  }
+  for(int bit=0; bit<256; bit++){ if((e[bit>>6]>>(bit&63))&1ull) f_mul(res,res,base); f_sqr(base,base); }
   f_copy(r,res);
 }
 
@@ -118,10 +73,8 @@ HD void f_inv(u64 r[4], const u64 a[4]){
 struct ECJ { u64 X[4], Y[4], Z[4]; };
 HD void ecj_inf(ECJ* P){ f_zero(P->X); f_zero(P->Y); f_zero(P->Z); }
 HD bool ecj_is_inf(const ECJ* P){ return f_iszero(P->Z); }
-
 HD void f_Gx(u64 r[4]){ r[0]=0x59F2815B16F81798ull; r[1]=0x029BFCDB2DCE28D9ull; r[2]=0x55A06295CE870B07ull; r[3]=0x79BE667EF9DCBBACull; }
 HD void f_Gy(u64 r[4]){ r[0]=0x9C47D08FFB10D4B8ull; r[1]=0xFD17B448A6855419ull; r[2]=0x5DA4FBFC0E1108A8ull; r[3]=0x483ADA7726A3C465ull; }
-
 HD void ecj_dbl(const ECJ* P, ECJ* R){
   if(ecj_is_inf(P)){ ecj_inf(R); return; }
   u64 A[4],B[4],C[4],D[4],E[4],F[4],t1[4],t2[4],X3[4],Y3[4],Z3[4];
@@ -137,8 +90,7 @@ HD void ecj_dbl(const ECJ* P, ECJ* R){
 HD void ecj_add_mixed(const ECJ* P, const u64 qx[4], const u64 qy[4], ECJ* R){
   if(ecj_is_inf(P)){ f_copy(R->X,qx); f_copy(R->Y,qy); f_zero(R->Z); R->Z[0]=1; return; }
   u64 Z1Z1[4],U2[4],S2[4],H[4],HH[4],I[4],J[4],r[4],V[4],t1[4],t2[4],X3[4],Y3[4],Z3[4];
-  f_sqr(Z1Z1,P->Z); f_mul(U2,qx,Z1Z1);
-  f_mul(S2,qy,P->Z); f_mul(S2,S2,Z1Z1);
+  f_sqr(Z1Z1,P->Z); f_mul(U2,qx,Z1Z1); f_mul(S2,qy,P->Z); f_mul(S2,S2,Z1Z1);
   f_sub(H,U2,P->X); f_sub(r,S2,P->Y);
   if(f_iszero(H)){ if(f_iszero(r)){ ecj_dbl(P,R); return; } ecj_inf(R); return; }
   f_add(r,r,r); f_sqr(HH,H); f_add(I,HH,HH); f_add(I,I,I);
@@ -182,14 +134,11 @@ HD void keccakf(u64 st[25]){
     st[0]^=RC[r];
   }
 }
-HD void f_to_be32(const u64 a[4], uint8_t out[32]){
-  for(int i=0;i<4;i++){ u64 w=a[3-i]; for(int b=0;b<8;b++) out[i*8+b]=(uint8_t)(w>>(56-8*b)); }
-}
+HD void f_to_be32(const u64 a[4], uint8_t out[32]){ for(int i=0;i<4;i++){ u64 w=a[3-i]; for(int b=0;b<8;b++) out[i*8+b]=(uint8_t)(w>>(56-8*b)); } }
 HD void pub_to_address(const u64 x[4], const u64 y[4], uint8_t addr[20]){
   uint8_t buf[64]; f_to_be32(x,buf); f_to_be32(y,buf+32);
-  u64 st[25]; for(int i=0;i<25;i++) st[i]=0;
-  uint8_t* sb=(uint8_t*)st; for(int i=0;i<64;i++) sb[i]^=buf[i]; sb[64]^=0x01; sb[135]^=0x80;
-  keccakf(st);
+  u64 st[25]; for(int i=0;i<25;i++) st[i]=0; uint8_t* sb=(uint8_t*)st;
+  for(int i=0;i<64;i++) sb[i]^=buf[i]; sb[64]^=0x01; sb[135]^=0x80; keccakf(st);
   for(int i=0;i<20;i++) addr[i]=sb[12+i];
 }
 
@@ -200,32 +149,28 @@ __device__ int g_found=0;
 __device__ u64 g_found_prefix=0;
 
 // =============================== KERNEL ====================================
+// p0 = indice de prefijo. Punto = p0*Q + S, con Q = 2^shift * G, S = sufijo*G.
 __global__ void search_kernel(u64 launch_base, unsigned run, u64 total){
   u64 gid=(u64)blockIdx.x*blockDim.x+threadIdx.x;
   u64 p0=launch_base + gid*(u64)run;
   if(p0>=total) return;
   unsigned myrun=run; if(p0+myrun>total) myrun=(unsigned)(total-p0);
-
-  u64 ks[4]={p0,0,0,0};                    // prefijo (<=48 bits) cabe en limb0
+  u64 ks[4]={p0,0,0,0};
   ECJ P; ec_scalar_mul(ks,c_Qx,c_Qy,&P);
   ECJ tmp; ecj_add_mixed(&P,c_Sx,c_Sy,&tmp); P=tmp;
-
   unsigned done=0;
   while(done<myrun){
     if(g_found) return;
     unsigned B=(myrun-done<BATCH)?(myrun-done):BATCH;
     ECJ pts[BATCH];
     for(unsigned b=0;b<B;b++){ pts[b]=P; ECJ t; ecj_add_mixed(&P,c_Qx,c_Qy,&t); P=t; }
-    u64 pref[BATCH][4];
-    f_copy(pref[0],pts[0].Z);
+    u64 pref[BATCH][4]; f_copy(pref[0],pts[0].Z);
     for(unsigned b=1;b<B;b++) f_mul(pref[b],pref[b-1],pts[b].Z);
     u64 inv[4]; f_inv(inv,pref[B-1]);
     for(int b=(int)B-1;b>=0;b--){
-      u64 zi[4];
-      if(b>0) f_mul(zi,inv,pref[b-1]); else f_copy(zi,inv);
+      u64 zi[4]; if(b>0) f_mul(zi,inv,pref[b-1]); else f_copy(zi,inv);
       u64 ninv[4]; f_mul(ninv,inv,pts[b].Z); f_copy(inv,ninv);
-      u64 z2[4],z3[4],x[4],y[4];
-      f_sqr(z2,zi); f_mul(x,pts[b].X,z2); f_mul(z3,z2,zi); f_mul(y,pts[b].Y,z3);
+      u64 z2[4],z3[4],x[4],y[4]; f_sqr(z2,zi); f_mul(x,pts[b].X,z2); f_mul(z3,z2,zi); f_mul(y,pts[b].Y,z3);
       uint8_t addr[20]; pub_to_address(x,y,addr);
       bool match=true; for(int i=0;i<20;i++) if(addr[i]!=c_target[i]){match=false;break;}
       if(match){ if(atomicCAS(&g_found,0,1)==0) g_found_prefix=p0+done+(unsigned)b; }
@@ -236,13 +181,10 @@ __global__ void search_kernel(u64 launch_base, unsigned run, u64 total){
 
 // =============================== SELF-TEST =================================
 __global__ void selftest_kernel(uint8_t* a1,uint8_t* a2,u64* g1x,u64* g1y,uint8_t* ke){
-  { u64 st[25]; for(int i=0;i<25;i++) st[i]=0; uint8_t* sb=(uint8_t*)st; sb[0]^=0x01; sb[135]^=0x80; keccakf(st);
-    for(int i=0;i<32;i++) ke[i]=sb[i]; }
+  { u64 st[25]; for(int i=0;i<25;i++) st[i]=0; uint8_t* sb=(uint8_t*)st; sb[0]^=0x01; sb[135]^=0x80; keccakf(st); for(int i=0;i<32;i++) ke[i]=sb[i]; }
   u64 Gx[4],Gy[4]; f_Gx(Gx); f_Gy(Gy);
-  { u64 k[4]={1,0,0,0}; ECJ R; ec_scalar_mul(k,Gx,Gy,&R); u64 x[4],y[4]; ecj_to_affine(&R,x,y);
-    for(int i=0;i<4;i++){g1x[i]=x[i];g1y[i]=y[i];} uint8_t a[20]; pub_to_address(x,y,a); for(int i=0;i<20;i++) a1[i]=a[i]; }
-  { u64 k[4]={2,0,0,0}; ECJ R; ec_scalar_mul(k,Gx,Gy,&R); u64 x[4],y[4]; ecj_to_affine(&R,x,y);
-    uint8_t a[20]; pub_to_address(x,y,a); for(int i=0;i<20;i++) a2[i]=a[i]; }
+  { u64 k[4]={1,0,0,0}; ECJ R; ec_scalar_mul(k,Gx,Gy,&R); u64 x[4],y[4]; ecj_to_affine(&R,x,y); for(int i=0;i<4;i++){g1x[i]=x[i];g1y[i]=y[i];} uint8_t a[20]; pub_to_address(x,y,a); for(int i=0;i<20;i++) a1[i]=a[i]; }
+  { u64 k[4]={2,0,0,0}; ECJ R; ec_scalar_mul(k,Gx,Gy,&R); u64 x[4],y[4]; ecj_to_affine(&R,x,y); uint8_t a[20]; pub_to_address(x,y,a); for(int i=0;i<20;i++) a2[i]=a[i]; }
 }
 
 // =============================== HOST UTILS ================================
@@ -250,23 +192,31 @@ static bool hexb(const char* h,uint8_t* o,int n){ if((int)strlen(h)!=n*2) return
   auto v=[](int c)->int{ if(c>='0'&&c<='9')return c-'0'; c=tolower(c); if(c>='a'&&c<='f')return c-'a'+10; return -1; };
   for(int i=0;i<n;i++){ int a=v(h[2*i]),b=v(h[2*i+1]); if(a<0||b<0)return false; o[i]=(uint8_t)((a<<4)|b);} return true; }
 static void ph(const uint8_t* b,int n){ for(int i=0;i<n;i++) printf("%02x",b[i]); }
-static bool suffix_to_scalar(const char* s52,u64 r[4]){ if((int)strlen(s52)!=52) return false;
-  char full[65]; for(int i=0;i<12;i++) full[i]='0'; memcpy(full+12,s52,52); full[64]=0;
+
+// sufijo de (64-prefixlen) hex -> escalar de 256 bits (bits altos = 0)
+static bool suffix_to_scalar(const char* suf,int prefixlen,u64 r[4]){
+  int suflen=64-prefixlen;
+  if((int)strlen(suf)!=suflen) return false;
+  char full[65]; for(int i=0;i<prefixlen;i++) full[i]='0'; memcpy(full+prefixlen,suf,suflen); full[64]=0;
   uint8_t be[32]; if(!hexb(full,be,32)) return false;
-  for(int i=0;i<4;i++){ u64 w=0; for(int b=0;b<8;b++) w=(w<<8)|be[(3-i)*8+b]; r[i]=w; } return true; }
+  for(int i=0;i<4;i++){ u64 w=0; for(int b=0;b<8;b++) w=(w<<8)|be[(3-i)*8+b]; r[i]=w; } return true;
+}
 
 int main(int argc,char**argv){
   const char* suffix=0; const char* addrhex=0; u64 start=0; bool st_only=false;
-  int blocks=8192,threads=256; unsigned run=8192;
+  int blocks=8192,threads=256; unsigned run=8192; int prefixlen=12;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--suffix")&&i+1<argc) suffix=argv[++i];
     else if(!strcmp(argv[i],"--addr")&&i+1<argc) addrhex=argv[++i];
+    else if(!strcmp(argv[i],"--prefixlen")&&i+1<argc) prefixlen=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--start")&&i+1<argc) start=strtoull(argv[++i],0,16);
     else if(!strcmp(argv[i],"--blocks")&&i+1<argc) blocks=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) threads=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--run")&&i+1<argc) run=(unsigned)strtoul(argv[++i],0,10);
     else if(!strcmp(argv[i],"--selftest")) st_only=true;
   }
+
+  // ---- self-test (siempre) ----
   uint8_t *d_a1,*d_a2,*d_ke; u64 *d_g1x,*d_g1y;
   CUDA_CHECK(cudaMalloc(&d_a1,20));CUDA_CHECK(cudaMalloc(&d_a2,20));CUDA_CHECK(cudaMalloc(&d_ke,32));
   CUDA_CHECK(cudaMalloc(&d_g1x,32));CUDA_CHECK(cudaMalloc(&d_g1y,32));
@@ -293,22 +243,34 @@ int main(int argc,char**argv){
   printf("  RESULTADO     : %s\n", ok?"TODO OK":"FALLO");
   if(!ok){ fprintf(stderr,"Self-test fallo: pasame esta salida.\n"); return 2; }
   if(st_only) return 0;
-  if(!suffix||!addrhex){ fprintf(stderr,"Uso: ./recover_fast --suffix <52hex> --addr <40hex> [--start <hex>]\n"); return 1; }
 
-  u64 s_scalar[4]; if(!suffix_to_scalar(suffix,s_scalar)){ fprintf(stderr,"sufijo invalido\n"); return 1; }
+  if(prefixlen<1 || prefixlen>15){ fprintf(stderr,"--prefixlen debe estar entre 1 y 15\n"); return 1; }
+  if(!suffix||!addrhex){
+    fprintf(stderr,"Uso: ./recover_fast --suffix <(64-N) hex> --addr <40 hex> [--prefixlen N] [--start <hex>]\n");
+    fprintf(stderr,"  N por defecto = 12 (sufijo de 52 hex). Para probar con 4: --prefixlen 4 (sufijo de 60 hex)\n");
+    return 1;
+  }
+
+  int shift = (64-prefixlen)*4;           // bits que ocupa el sufijo
+  u64 s_scalar[4];
+  if(!suffix_to_scalar(suffix,prefixlen,s_scalar)){
+    fprintf(stderr,"sufijo invalido: con --prefixlen %d debe tener %d hex\n",prefixlen,64-prefixlen); return 1; }
   uint8_t target[20]; { const char* p=addrhex; if(p[0]=='0'&&(p[1]=='x'||p[1]=='X'))p+=2;
-    if(!hexb(p,target,20)){ fprintf(stderr,"direccion invalida\n"); return 1; } }
-  u64 Qsc[4]={0,0,0,0x10000ull}; // 2^208
+    if(!hexb(p,target,20)){ fprintf(stderr,"direccion invalida (40 hex)\n"); return 1; } }
+
+  // Q = 2^shift * G
+  u64 Qsc[4]={0,0,0,0}; Qsc[shift>>6] = (1ull<<(shift&63));
   ECJ Sj,Qj; ec_scalar_mul(s_scalar,Gx,Gy,&Sj); ec_scalar_mul(Qsc,Gx,Gy,&Qj);
   u64 Sx[4],Sy[4],Qx[4],Qy[4]; ecj_to_affine(&Sj,Sx,Sy); ecj_to_affine(&Qj,Qx,Qy);
   CUDA_CHECK(cudaMemcpyToSymbol(c_Sx,Sx,32));CUDA_CHECK(cudaMemcpyToSymbol(c_Sy,Sy,32));
   CUDA_CHECK(cudaMemcpyToSymbol(c_Qx,Qx,32));CUDA_CHECK(cudaMemcpyToSymbol(c_Qy,Qy,32));
   CUDA_CHECK(cudaMemcpyToSymbol(c_target,target,20));
 
-  const u64 TOTAL=1ull<<48;
+  const u64 TOTAL = 1ull << (4*prefixlen);   // 16^N
   u64 base=start; u64 per=(u64)blocks*threads*run;
-  printf("\n== BUSQUEDA (BATCH=%d, %dx%d, run=%u) ==\n",BATCH,blocks,threads,run);
-  printf("inicio 0x%012llx  | %llu prefijos/lanzamiento\n",base,per);
+  printf("\n== BUSQUEDA (prefixlen=%d, 16^%d=%llu, BATCH=%d, %dx%d, run=%u) ==\n",
+         prefixlen,prefixlen,TOTAL,BATCH,blocks,threads,run);
+  printf("inicio 0x%0*llx\n", prefixlen, base);
   int zero=0; CUDA_CHECK(cudaMemcpyToSymbol(g_found,&zero,sizeof(int)));
   cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
   while(base<TOTAL){
@@ -318,11 +280,14 @@ int main(int argc,char**argv){
     float ms=0; cudaEventElapsedTime(&ms,e0,e1);
     int found=0; CUDA_CHECK(cudaMemcpyFromSymbol(&found,g_found,sizeof(int)));
     if(found){ u64 pref=0; CUDA_CHECK(cudaMemcpyFromSymbol(&pref,g_found_prefix,sizeof(u64)));
-      printf("\n*** ENCONTRADA ***\nprefijo: %012llx\nclave  : %012llx%s\n",pref,pref,suffix); return 0; }
+      printf("\n*** ENCONTRADA ***\nprefijo (%d hex): %0*llx\nclave privada  : %0*llx%s\n",
+             prefixlen, prefixlen, pref, prefixlen, pref, suffix);
+      return 0; }
     u64 cov=(base+per<=TOTAL)?per:(TOTAL-base); base+=cov;
     double rate=(ms>0)?(cov/(ms/1000.0)):0, eta=(rate>0)?((double)(TOTAL-base)/rate):0;
-    printf("0x%012llx  %.4f%%  %.1f Mkeys/s  ETA %.2f h\r",base,(double)base/TOTAL*100.0,rate/1e6,eta/3600.0);
+    printf("0x%0*llx  %.4f%%  %.1f Mkeys/s  ETA %.2f h\r",prefixlen,base,(double)base/TOTAL*100.0,rate/1e6,eta/3600.0);
     fflush(stdout);
   }
-  printf("\nEspacio agotado sin coincidencia.\n"); return 0;
+  printf("\nEspacio agotado sin coincidencia. Revisa sufijo/direccion/prefixlen.\n");
+  return 0;
 }
