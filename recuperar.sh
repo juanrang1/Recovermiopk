@@ -19,9 +19,9 @@
 #   --missing start|end   Donde faltan los caracteres. Default: start.
 #   --n <N>           Cuantos hex faltan (1..15). Default: 12.
 #   --gpus <num>      Forzar numero de GPUs (default: autodetecta).
-#   --batch <num>     Tamano de lote (default 128). Recompila si cambia.
+#   --batch <num>     Tamano de lote (default 256, optimo medido). Recompila si cambia.
 #   --blocks <num>    Default 16384.   --threads <num>  Default 256.
-#   --rate <Mkeys>    Mkeys/s por GPU para estimar tiempo (default 677).
+#   --rate <Mkeys>    Mkeys/s por GPU para estimar tiempo (default 720, ~RTX 5090).
 #   --selftest        Solo compilar y correr el self-test, sin buscar.
 #   --yes             No pedir confirmacion antes de un run largo.
 #
@@ -31,8 +31,8 @@
 # =============================================================================
 set -euo pipefail
 
-KNOWN="" ADDR="" MISSING="start" N=12 GPUS="" BATCH=128 BLOCKS=16384 THREADS=256
-RATE=677 SELFTEST_ONLY=0 ASSUME_YES=0
+KNOWN="" ADDR="" MISSING="start" N=12 GPUS="" BATCH=256 BLOCKS=16384 THREADS=256
+RATE=720 SELFTEST_ONLY=0 ASSUME_YES=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
