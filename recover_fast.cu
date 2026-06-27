@@ -347,11 +347,11 @@ int main(int argc,char**argv){
       } else if(endmode){
         // conocido (alto) + N hex encontrados (bajo)
         printf("\n*** ENCONTRADA ***\nparte faltante (%d hex, al final): %0*llx\nclave privada  : %s%0*llx\n",
-               prefixlen, prefixlen, pref, known, prefixlen, pref);
+               prefixlen, prefixlen, pref, prefixhex, prefixlen, pref);
       } else {
         // N hex encontrados (alto) + conocido (bajo)
         printf("\n*** ENCONTRADA ***\nparte faltante (%d hex, al inicio): %0*llx\nclave privada  : %0*llx%s\n",
-               prefixlen, prefixlen, pref, prefixlen, pref, known);
+               prefixlen, prefixlen, pref, prefixlen, pref, suffix);
       }
       return 0; }
     u64 cov=(base+per<=endp)?per:(endp-base); base+=cov;
