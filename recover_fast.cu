@@ -220,6 +220,12 @@ static bool known_to_scalar(const char* known,int prefixlen,bool endmode,u64 r[4
 }
 
 
+// convierte un string de 64 hex completo a escalar de 256 bits
+static bool full_to_scalar(const char* full64, u64 r[4]){
+  uint8_t be[32]; if(!hexb(full64,be,32)) return false;
+  for(int i=0;i<4;i++){ u64 w=0; for(int b=0;b<8;b++) w=(w<<8)|be[(3-i)*8+b]; r[i]=w; } return true;
+}
+
 int main(int argc,char**argv){
   const char* suffix=0; const char* addrhex=0; u64 start=0; bool st_only=false;
   int blocks=8192,threads=256; unsigned run=8192; int prefixlen=12;
@@ -267,30 +273,52 @@ int main(int argc,char**argv){
   if(!ok){ fprintf(stderr,"Self-test fallo: pasame esta salida.\n"); return 2; }
   if(st_only) return 0;
 
-  if(prefixlen<1 || prefixlen>15){ fprintf(stderr,"--prefixlen debe estar entre 1 y 15\n"); return 1; }
   bool endmode = !strcmp(missing,"end");
-  if(strcmp(missing,"start") && strcmp(missing,"end")){ fprintf(stderr,"--missing debe ser 'start' o 'end'\n"); return 1; }
-  const char* known = endmode ? prefixhex : suffix;   // parte conocida = (64-N) hex
-  if(!known || !addrhex){
-    fprintf(stderr,"Uso:\n");
-    fprintf(stderr,"  Faltan los PRIMEROS N (default):  ./recover_fast --suffix <(64-N)hex> --addr <40hex> [--prefixlen N]\n");
-    fprintf(stderr,"  Faltan los ULTIMOS  N:            ./recover_fast --missing end --prefix <(64-N)hex> --addr <40hex> [--prefixlen N]\n");
-    fprintf(stderr,"  N por defecto = 12. Prueba con 4 antes de gastar GPU.\n");
-    return 1;
-  }
+  bool midmode = !strcmp(missing,"middle");
+  if(strcmp(missing,"start") && strcmp(missing,"end") && strcmp(missing,"middle")){
+    fprintf(stderr,"--missing debe ser 'start', 'end' o 'middle'\n"); return 1; }
 
-  u64 s_scalar[4];
-  if(!known_to_scalar(known,prefixlen,endmode,s_scalar)){
-    fprintf(stderr,"parte conocida invalida: con --prefixlen %d debe tener %d hex\n",prefixlen,64-prefixlen); return 1; }
+  u64 s_scalar[4]; int shift; char fullkey[65];
+  if(midmode){
+    if(!prefixhex || !suffix || !addrhex){
+      fprintf(stderr,"Modo medio: ./recover_fast --missing middle --prefix <hex> --suffix <hex> --addr <40hex>\n");
+      return 1; }
+    int plen=(int)strlen(prefixhex), slen=(int)strlen(suffix);
+    prefixlen = 64 - plen - slen;                 // N = cuantos faltan en el medio
+    if(prefixlen<1 || prefixlen>15){
+      fprintf(stderr,"Faltan %d hex en el medio; admite 1..15 (prefijo %d + sufijo %d = %d hex conocidos)\n",
+              prefixlen,plen,slen,plen+slen); return 1; }
+    // full = prefijo + ceros(N) + sufijo
+    memcpy(fullkey,prefixhex,plen);
+    for(int i=0;i<prefixlen;i++) fullkey[plen+i]='0';
+    memcpy(fullkey+plen+prefixlen,suffix,slen);
+    fullkey[64]=0;
+    if(!full_to_scalar(fullkey,s_scalar)){ fprintf(stderr,"prefijo/sufijo invalidos (solo hex)\n"); return 1; }
+    shift = slen*4;                               // bits conocidos a la derecha del hueco
+  } else {
+    if(prefixlen<1 || prefixlen>15){ fprintf(stderr,"--prefixlen debe estar entre 1 y 15\n"); return 1; }
+    const char* known = endmode ? prefixhex : suffix;   // parte conocida = (64-N) hex
+    if(!known || !addrhex){
+      fprintf(stderr,"Uso:\n");
+      fprintf(stderr,"  Faltan los PRIMEROS N (default):  ./recover_fast --suffix <(64-N)hex> --addr <40hex> [--prefixlen N]\n");
+      fprintf(stderr,"  Faltan los ULTIMOS  N:            ./recover_fast --missing end --prefix <(64-N)hex> --addr <40hex> [--prefixlen N]\n");
+      fprintf(stderr,"  Faltan en el MEDIO:               ./recover_fast --missing middle --prefix <hex> --suffix <hex> --addr <40hex>\n");
+      fprintf(stderr,"  N por defecto = 12. Prueba con 4 antes de gastar GPU.\n");
+      return 1;
+    }
+    if(!known_to_scalar(known,prefixlen,endmode,s_scalar)){
+      fprintf(stderr,"parte conocida invalida: con --prefixlen %d debe tener %d hex\n",prefixlen,64-prefixlen); return 1; }
+    shift = endmode ? 0 : (64-prefixlen)*4;
+  }
   uint8_t target[20]; { const char* p=addrhex; if(p[0]=='0'&&(p[1]=='x'||p[1]=='X'))p+=2;
     if(!hexb(p,target,20)){ fprintf(stderr,"direccion invalida (40 hex)\n"); return 1; } }
 
-  // Incremento Q:
-  //   start: candidatos saltan 2^((64-N)*4)  -> Q = 2^shift * G
-  //   end  : candidatos consecutivos (low+1) -> Q = G
+  // Incremento Q = 2^shift * G  (shift = nibbles conocidos a la derecha del hueco * 4)
+  //   end   : shift=0          -> Q = G            (candidatos consecutivos)
+  //   start : shift=(64-N)*4   -> Q = 2^shift * G  (saltan)
+  //   middle: shift=slen*4     -> Q = 2^shift * G
   u64 Qsc[4]={0,0,0,0};
-  if(endmode){ Qsc[0]=1; }
-  else { int shift=(64-prefixlen)*4; Qsc[shift>>6] = (1ull<<(shift&63)); }
+  Qsc[shift>>6] = (1ull<<(shift&63));
   ECJ Sj,Qj; ec_scalar_mul(s_scalar,Gx,Gy,&Sj); ec_scalar_mul(Qsc,Gx,Gy,&Qj);
   u64 Sx[4],Sy[4],Qx[4],Qy[4]; ecj_to_affine(&Sj,Sx,Sy); ecj_to_affine(&Qj,Qx,Qy);
   CUDA_CHECK(cudaMemcpyToSymbol(c_Sx,Sx,32));CUDA_CHECK(cudaMemcpyToSymbol(c_Sy,Sy,32));
@@ -312,7 +340,11 @@ int main(int argc,char**argv){
     float ms=0; cudaEventElapsedTime(&ms,e0,e1);
     int found=0; CUDA_CHECK(cudaMemcpyFromSymbol(&found,g_found,sizeof(int)));
     if(found){ u64 pref=0; CUDA_CHECK(cudaMemcpyFromSymbol(&pref,g_found_prefix,sizeof(u64)));
-      if(endmode){
+      if(midmode){
+        // prefijo + N hex encontrados (medio) + sufijo
+        printf("\n*** ENCONTRADA ***\nparte faltante (%d hex, en el medio): %0*llx\nclave privada  : %s%0*llx%s\n",
+               prefixlen, prefixlen, pref, prefixhex, prefixlen, pref, suffix);
+      } else if(endmode){
         // conocido (alto) + N hex encontrados (bajo)
         printf("\n*** ENCONTRADA ***\nparte faltante (%d hex, al final): %0*llx\nclave privada  : %s%0*llx\n",
                prefixlen, prefixlen, pref, known, prefixlen, pref);
