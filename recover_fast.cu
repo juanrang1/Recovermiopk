@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <cmath>
 #include <cuda_runtime.h>
 
 #define CUDA_CHECK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
@@ -159,10 +160,39 @@ __constant__ u64 c_Qx[4], c_Qy[4], c_Sx[4], c_Sy[4];
 __constant__ uint8_t c_target[20];
 __device__ int g_found=0;
 __device__ u64 g_found_prefix=0;
+__device__ uint8_t g_found_addr[20];
+
+// ---- Bloom filter + verificacion exacta contra la base ordenada (modo --basedatos) ----
+__device__ __forceinline__ u64 dmix64(u64 x){
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x>>30))*0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x>>27))*0x94D049BB133111EBULL;
+  return x ^ (x>>31);
+}
+__device__ __forceinline__ u64 dfnv20(const uint8_t* a, u64 seed){
+  u64 h=(1469598103934665603ULL ^ seed);
+  #pragma unroll
+  for(int i=0;i<20;i++){ h^=a[i]; h*=1099511628211ULL; }
+  return h;
+}
+__device__ __forceinline__ bool bloom_maybe(const unsigned int* bloom, u64 nbits, int k, const uint8_t* a){
+  u64 h1=dmix64(dfnv20(a,0xA5A5ULL)), h2=dmix64(dfnv20(a,0x5A5AULL))|1ULL;
+  for(int i=0;i<k;i++){ u64 idx=(h1+(u64)i*h2)%nbits; if(!(bloom[idx>>5]&(1u<<(idx&31)))) return false; }
+  return true;
+}
+__device__ __forceinline__ bool db_contains(const uint8_t* db, u64 n, const uint8_t* a){
+  u64 lo=0, hi=n;
+  while(lo<hi){ u64 mid=(lo+hi)>>1; const uint8_t* e=db+mid*20; int c=0;
+    for(int i=0;i<20;i++){ if(a[i]<e[i]){c=-1;break;} if(a[i]>e[i]){c=1;break;} }
+    if(c==0) return true; if(c<0) hi=mid; else lo=mid+1; }
+  return false;
+}
 
 // =============================== KERNEL ====================================
 // p0 = indice de prefijo. Punto = p0*Q + S, con Q = 2^shift * G, S = sufijo*G.
-__global__ void search_kernel(u64 launch_base, unsigned run, u64 total){
+__global__ void search_kernel(u64 launch_base, unsigned run, u64 total,
+                              const unsigned int* bloom, u64 bloom_nbits, int bloom_k,
+                              const uint8_t* db_sorted, u64 db_n, int db_mode){
   u64 gid=(u64)blockIdx.x*blockDim.x+threadIdx.x;
   u64 p0=launch_base + gid*(u64)run;
   if(p0>=total) return;
@@ -184,8 +214,15 @@ __global__ void search_kernel(u64 launch_base, unsigned run, u64 total){
       u64 ninv[4]; f_mul(ninv,inv,pts[b].Z); f_copy(inv,ninv);
       u64 z2[4],z3[4],x[4],y[4]; f_sqr(z2,zi); f_mul(x,pts[b].X,z2); f_mul(z3,z2,zi); f_mul(y,pts[b].Y,z3);
       uint8_t addr[20]; pub_to_address(x,y,addr);
-      bool match=true; for(int i=0;i<20;i++) if(addr[i]!=c_target[i]){match=false;break;}
-      if(match){ if(atomicCAS(&g_found,0,1)==0) g_found_prefix=p0+done+(unsigned)b; }
+      bool match;
+      if(db_mode){
+        // Bloom (rechazo barato) + verificacion exacta en la base ordenada (cero falsos positivos)
+        match = bloom_maybe(bloom,bloom_nbits,bloom_k,addr) && db_contains(db_sorted,db_n,addr);
+      } else {
+        match=true; for(int i=0;i<20;i++) if(addr[i]!=c_target[i]){match=false;break;}
+      }
+      if(match){ if(atomicCAS(&g_found,0,1)==0){ g_found_prefix=p0+done+(unsigned)b;
+        for(int i=0;i<20;i++) g_found_addr[i]=addr[i]; } }
     }
     done+=B;
   }
@@ -204,6 +241,12 @@ static bool hexb(const char* h,uint8_t* o,int n){ if((int)strlen(h)!=n*2) return
   auto v=[](int c)->int{ if(c>='0'&&c<='9')return c-'0'; c=tolower(c); if(c>='a'&&c<='f')return c-'a'+10; return -1; };
   for(int i=0;i<n;i++){ int a=v(h[2*i]),b=v(h[2*i+1]); if(a<0||b<0)return false; o[i]=(uint8_t)((a<<4)|b);} return true; }
 static void ph(const uint8_t* b,int n){ for(int i=0;i<n;i++) printf("%02x",b[i]); }
+
+// ---- helpers host para --basedatos ----
+static int hexval(int c){ if(c>='0'&&c<='9')return c-'0'; c=tolower(c); if(c>='a'&&c<='f')return c-'a'+10; return -1; }
+static u64 hmix64(u64 x){ x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x>>30))*0xBF58476D1CE4E5B9ULL; x = (x ^ (x>>27))*0x94D049BB133111EBULL; return x ^ (x>>31); }
+static u64 hfnv20(const uint8_t* a, u64 seed){ u64 h=(1469598103934665603ULL ^ seed); for(int i=0;i<20;i++){ h^=a[i]; h*=1099511628211ULL; } return h; }
+static int cmp20(const void* a,const void* b){ return memcmp(a,b,20); }
 
 // parte conocida de (64-N) hex -> escalar de 256 bits.
 //  endmode=false: lo desconocido va al INICIO -> conocido en bits bajos  (full = ceros + conocido)
@@ -231,11 +274,13 @@ int main(int argc,char**argv){
   int blocks=8192,threads=256; unsigned run=8192; int prefixlen=12;
   u64 endarg=0; bool has_end=false;
   const char* prefixhex=0; const char* missing="start";
+  const char* dbfile=0; int db_mode=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--suffix")&&i+1<argc) suffix=argv[++i];
     else if(!strcmp(argv[i],"--prefix")&&i+1<argc) prefixhex=argv[++i];
     else if(!strcmp(argv[i],"--missing")&&i+1<argc) missing=argv[++i];
     else if(!strcmp(argv[i],"--addr")&&i+1<argc) addrhex=argv[++i];
+    else if(!strcmp(argv[i],"--basedatos")&&i+1<argc){ dbfile=argv[++i]; db_mode=1; }
     else if(!strcmp(argv[i],"--prefixlen")&&i+1<argc) prefixlen=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--start")&&i+1<argc) start=strtoull(argv[++i],0,16);
     else if(!strcmp(argv[i],"--end")&&i+1<argc){ endarg=strtoull(argv[++i],0,16); has_end=true; }
@@ -280,8 +325,8 @@ int main(int argc,char**argv){
 
   u64 s_scalar[4]; int shift; char fullkey[65];
   if(midmode){
-    if(!prefixhex || !suffix || !addrhex){
-      fprintf(stderr,"Modo medio: ./recover_fast --missing middle --prefix <hex> --suffix <hex> --addr <40hex>\n");
+    if(!prefixhex || !suffix || (!addrhex && !db_mode)){
+      fprintf(stderr,"Modo medio: ./recover_fast --missing middle --prefix <hex> --suffix <hex> (--addr <40hex> | --basedatos saldos.txt)\n");
       return 1; }
     int plen=(int)strlen(prefixhex), slen=(int)strlen(suffix);
     prefixlen = 64 - plen - slen;                 // N = cuantos faltan en el medio
@@ -298,11 +343,12 @@ int main(int argc,char**argv){
   } else {
     if(prefixlen<1 || prefixlen>15){ fprintf(stderr,"--prefixlen debe estar entre 1 y 15\n"); return 1; }
     const char* known = endmode ? prefixhex : suffix;   // parte conocida = (64-N) hex
-    if(!known || !addrhex){
+    if(!known || (!addrhex && !db_mode)){
       fprintf(stderr,"Uso:\n");
       fprintf(stderr,"  Faltan los PRIMEROS N (default):  ./recover_fast --suffix <(64-N)hex> --addr <40hex> [--prefixlen N]\n");
       fprintf(stderr,"  Faltan los ULTIMOS  N:            ./recover_fast --missing end --prefix <(64-N)hex> --addr <40hex> [--prefixlen N]\n");
       fprintf(stderr,"  Faltan en el MEDIO:               ./recover_fast --missing middle --prefix <hex> --suffix <hex> --addr <40hex>\n");
+      fprintf(stderr,"  Contra base de datos (sin --addr): agrega --basedatos saldos.txt\n");
       fprintf(stderr,"  N por defecto = 12. Prueba con 4 antes de gastar GPU.\n");
       return 1;
     }
@@ -310,7 +356,8 @@ int main(int argc,char**argv){
       fprintf(stderr,"parte conocida invalida: con --prefixlen %d debe tener %d hex\n",prefixlen,64-prefixlen); return 1; }
     shift = endmode ? 0 : (64-prefixlen)*4;
   }
-  uint8_t target[20]; { const char* p=addrhex; if(p[0]=='0'&&(p[1]=='x'||p[1]=='X'))p+=2;
+  uint8_t target[20];
+  if(!db_mode){ const char* p=addrhex; if(p[0]=='0'&&(p[1]=='x'||p[1]=='X'))p+=2;
     if(!hexb(p,target,20)){ fprintf(stderr,"direccion invalida (40 hex)\n"); return 1; } }
 
   // Incremento Q = 2^shift * G  (shift = nibbles conocidos a la derecha del hueco * 4)
@@ -323,7 +370,45 @@ int main(int argc,char**argv){
   u64 Sx[4],Sy[4],Qx[4],Qy[4]; ecj_to_affine(&Sj,Sx,Sy); ecj_to_affine(&Qj,Qx,Qy);
   CUDA_CHECK(cudaMemcpyToSymbol(c_Sx,Sx,32));CUDA_CHECK(cudaMemcpyToSymbol(c_Sy,Sy,32));
   CUDA_CHECK(cudaMemcpyToSymbol(c_Qx,Qx,32));CUDA_CHECK(cudaMemcpyToSymbol(c_Qy,Qy,32));
-  CUDA_CHECK(cudaMemcpyToSymbol(c_target,target,20));
+  if(!db_mode) CUDA_CHECK(cudaMemcpyToSymbol(c_target,target,20));
+
+  // ---- modo base de datos: cargar direcciones, construir Bloom + subir base ordenada ----
+  unsigned int* d_bloom=NULL; u64 bloom_nbits=0; int bloom_k=0;
+  uint8_t* d_db=NULL; u64 db_n=0;
+  if(db_mode){
+    FILE* fdb=fopen(dbfile,"r"); if(!fdb){ fprintf(stderr,"No se pudo abrir la base %s\n",dbfile); return 1; }
+    u64 cap=1ull<<20; uint8_t* addrs=(uint8_t*)malloc(cap*20); db_n=0; char line[256];
+    while(fgets(line,sizeof(line),fdb)){
+      char* p=line; while(*p==' '||*p=='\t') p++;
+      if(p[0]=='0'&&(p[1]=='x'||p[1]=='X')) p+=2;
+      uint8_t t[20]; int ok=1;
+      for(int i=0;i<20;i++){ int hi=hexval(p[2*i]), lo=hexval(p[2*i+1]); if(hi<0||lo<0){ok=0;break;} t[i]=(uint8_t)((hi<<4)|lo); }
+      if(!ok) continue;
+      if(db_n>=cap){ cap*=2; addrs=(uint8_t*)realloc(addrs,cap*20); if(!addrs){ fprintf(stderr,"sin memoria cargando la base\n"); return 1; } }
+      memcpy(addrs+db_n*20,t,20); db_n++;
+    }
+    fclose(fdb);
+    if(db_n==0){ fprintf(stderr,"La base no tiene direcciones validas (una por linea, 40 hex).\n"); return 1; }
+    qsort(addrs, db_n, 20, cmp20);
+    // Bloom con fp modesto (~1e-4): filtro barato; la verificacion exacta elimina los FP
+    double fpr=1e-4;
+    double mb=-(double)db_n*log(fpr)/(0.6931471806*0.6931471806);
+    bloom_nbits=(u64)mb; if(bloom_nbits<1024)bloom_nbits=1024; bloom_nbits=((bloom_nbits+31)/32)*32;
+    bloom_k=(int)(0.6931471806*(double)bloom_nbits/(double)db_n+0.5); if(bloom_k<1)bloom_k=1; if(bloom_k>20)bloom_k=20;
+    u64 nwords=bloom_nbits/32;
+    unsigned int* h_bloom=(unsigned int*)calloc(nwords,sizeof(unsigned int));
+    for(u64 i=0;i<db_n;i++){
+      u64 h1=hmix64(hfnv20(addrs+i*20,0xA5A5ULL)), h2=hmix64(hfnv20(addrs+i*20,0x5A5AULL))|1ULL;
+      for(int j=0;j<bloom_k;j++){ u64 idx=(h1+(u64)j*h2)%bloom_nbits; h_bloom[idx>>5]|=(1u<<(idx&31)); }
+    }
+    printf("Base de datos: %llu direcciones. Bloom %.1f MB (k=%d) + base %.0f MB en GPU.\n",
+           (unsigned long long)db_n, nwords*4.0/1e6, bloom_k, db_n*20/1e6);
+    CUDA_CHECK(cudaMalloc(&d_bloom, nwords*sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemcpy(d_bloom, h_bloom, nwords*sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_db, db_n*20));
+    CUDA_CHECK(cudaMemcpy(d_db, addrs, db_n*20, cudaMemcpyHostToDevice));
+    free(h_bloom); free(addrs);
+  }
 
   const u64 TOTAL = 1ull << (4*prefixlen);   // 16^N
   u64 endp = (has_end && endarg<=TOTAL) ? endarg : TOTAL;
@@ -335,11 +420,13 @@ int main(int argc,char**argv){
   cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
   while(base<endp){
     cudaEventRecord(e0);
-    search_kernel<<<blocks,threads>>>(base,run,endp); CUDA_CHECK(cudaGetLastError());
+    search_kernel<<<blocks,threads>>>(base,run,endp,d_bloom,bloom_nbits,bloom_k,d_db,db_n,db_mode); CUDA_CHECK(cudaGetLastError());
     cudaEventRecord(e1); CUDA_CHECK(cudaEventSynchronize(e1));
     float ms=0; cudaEventElapsedTime(&ms,e0,e1);
     int found=0; CUDA_CHECK(cudaMemcpyFromSymbol(&found,g_found,sizeof(int)));
     if(found){ u64 pref=0; CUDA_CHECK(cudaMemcpyFromSymbol(&pref,g_found_prefix,sizeof(u64)));
+      if(db_mode){ uint8_t fa[20]; CUDA_CHECK(cudaMemcpyFromSymbol(fa,g_found_addr,20));
+        printf("\n*** ENCONTRADA EN LA BASE *** direccion 0x"); for(int i=0;i<20;i++) printf("%02x",fa[i]); printf("\n"); }
       if(midmode){
         // prefijo + N hex encontrados (medio) + sufijo
         printf("\n*** ENCONTRADA ***\nparte faltante (%d hex, en el medio): %0*llx\nclave privada  : %s%0*llx%s\n",
